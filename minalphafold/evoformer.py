@@ -180,18 +180,75 @@ class OuterProductMean(torch.nn.Module):
 class TriangleMultiplicationOutgoing(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        pass
+        self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
+        self.layer_norm_out = torch.nn.LayerNorm(config.triangle_mult_c)
+
+        self.gate1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.gate2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+
+        self.linear1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.linear2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+
+        self.gate = torch.nn.Linear(in_features=config.c_z, out_features=config.c_z)
+
+        self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
 
     def forward(self, pair_representation: torch.Tensor):
-        pass
+        pair_representation = self.layer_norm_pair(pair_representation)
+
+        # Shape (batch, N_res, N_res, config.triangle_mult_c)
+        A = torch.nn.functional.sigmoid(self.gate1(pair_representation)) * self.linear1(pair_representation)
+        B = torch.nn.functional.sigmoid(self.gate2(pair_representation)) * self.linear2(pair_representation)
+        
+        # Shape (batch, N_res, N_res, c_z)
+        G = torch.nn.functional.sigmoid(self.gate(pair_representation))
+
+        # A: (batch, N_res_i, N_res_k, c)
+        # B: (batch, N_res_j, N_res_k, c)
+        # Result: (batch, N_res_i, N_res_j, c)
+        vals = torch.einsum('bikc, bjkc -> bijc', A, B)
+
+        # Shape (batch, N_res, N_res, c_z)
+        out = G * self.out_linear(self.layer_norm_out(vals))
+        
+        return out
+
 
 class TriangleMultiplicationIncoming(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        pass
+        self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
+        self.layer_norm_out = torch.nn.LayerNorm(config.triangle_mult_c)
+
+        self.gate1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.gate2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+
+        self.linear1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.linear2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+
+        self.gate = torch.nn.Linear(in_features=config.c_z, out_features=config.c_z)
+
+        self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
 
     def forward(self, pair_representation: torch.Tensor):
-        pass
+        pair_representation = self.layer_norm_pair(pair_representation)
+
+        # Shape (batch, N_res, N_res, config.triangle_mult_c)
+        A = torch.nn.functional.sigmoid(self.gate1(pair_representation)) * self.linear1(pair_representation)
+        B = torch.nn.functional.sigmoid(self.gate2(pair_representation)) * self.linear2(pair_representation)
+        
+        # Shape (batch, N_res, N_res, c_z)
+        G = torch.nn.functional.sigmoid(self.gate(pair_representation))
+
+        # A: (batch, N_res_i, N_res_k, c)
+        # B: (batch, N_res_j, N_res_k, c)
+        # Result: (batch, N_res_i, N_res_j, c)
+        vals = torch.einsum('bkic, bkjc -> bijc', A, B)
+
+        # Shape (batch, N_res, N_res, c_z)
+        out = G * self.out_linear(self.layer_norm_out(vals))
+        
+        return out
 
 class TriangleAttentionStartingNode(torch.nn.Module):
     def __init__(self, config):
