@@ -137,3 +137,59 @@ class InvariantPointAttention(torch.nn.Module):
         output = self.linear_output(output)
 
         return output
+    
+class BackboneUpdate(torch.nn.Module):
+    def __init__(self, config):
+        self.linear = torch.nn.Linear(in_features=config.c_s, out_features=6)
+
+    def forward(self, single_representation: torch.Tensor):
+        # output shape; (batch, N_res, 6)
+        vals = self.linear(single_representation)
+
+        # Rotation quaternions
+        b = vals[:, :, 0]
+        c = vals[:, :, 1]
+        d = vals[:, :, 2]
+
+        a = torch.ones_like(b)
+        norm = torch.sqrt(1 + b**2 + c**2 + d**2)
+
+        a = a / norm
+        b = b / norm
+        c = c / norm
+        d = d / norm
+
+        # Construct pairwise multiplications for rotation matrix
+        aa = a*a
+        bb = b*b
+        cc = c*c
+        dd = d*d
+
+        ab = a*b
+        ac = a*c
+        ad = a*d
+
+        bc = b*c
+        bd = b*d
+
+        cd = c*d
+
+        # Construct rotation matrix entries
+        r11 = aa + bb - cc - dd
+        r12 = 2*bc - 2*ad
+        r13 = 2*bd + 2*ac
+
+        r21 = 2*bc + 2*ad
+        r22 = aa - bb + cc - dd
+        r23 = 2*cd - 2*ab
+
+        r31 = 2*bd - 2*ac
+        r32 = 2*cd + 2*ab
+        r33 = aa - bb - cc + dd
+
+        # Output shape: (batch, N_res, 3, 3)
+        R = torch.stack([r11, r12, r13, r21, r22, r23, r31, r32, r33], dim=-1).reshape((single_representation.shape[0], single_representation.shape[1], 3, 3))
+
+        t = vals[:, :, 3:]
+
+        return R, t
