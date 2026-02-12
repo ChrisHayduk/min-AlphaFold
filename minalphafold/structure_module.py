@@ -38,7 +38,7 @@ class StructureModule(torch.nn.Module):
         self.angle_linear_5 = torch.nn.Linear(in_features=self.c, out_features=self.c)
         self.angle_linear_6 = torch.nn.Linear(in_features=self.c, out_features=self.c)
 
-        self.angle_linear_7 = torch.nn.Linear(in_features=self.c, out_features=2)
+        self.angle_linear_7 = torch.nn.Linear(in_features=self.c, out_features=14)
 
         # Core blocks
         self.IPA = InvariantPointAttention(config)
@@ -53,18 +53,15 @@ class StructureModule(torch.nn.Module):
 
         s = self.single_rep_proj(single_representation)
 
-        rotations = torch.eye((3))
+        rotations = torch.eye(3, device=s.device, dtype=s.dtype).view(1, 1, 3, 3).expand(s.shape[0], s.shape[1], 3, 3)
 
-        # Reshape to (batch, N_res, 3, 3)
-        rotations = rotations.view(1, 1, 3, 3).expand(s.shape[0], s.shape[1], 3, 3)
-
-        translations = torch.zeros((s.shape[0], s.shape[1], 3))
+        translations = torch.zeros(s.shape[0], s.shape[1], 3, device=s.device, dtype=s.dtype)
 
         # Collect intermediates for auxiliary losses
         all_rotations = []
         all_translations = []
         all_torsion_angles = []
-        alpha = torch.zeros((s.shape[0], s.shape[1], 7, 2), device=single_representation.device)
+        alpha = torch.zeros(s.shape[0], s.shape[1], 7, 2, device=s.device, dtype=s.dtype)
 
         for l in range(self.num_layers):
             # Stop rotation gradients between iterations
@@ -73,20 +70,17 @@ class StructureModule(torch.nn.Module):
 
             s += self.IPA(s, pair_representation, rotations, translations)
 
-            s = self.layer_norm_single_rep_1(self.dropout_1(s))
+            s = self.dropout_1(self.layer_norm_single_rep_3(s))
 
             # Transition
             s += self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s)))))
-            s = self.layer_norm_single_rep_2(self.dropout_2(s))
+            s = self.dropout_2(self.layer_norm_single_rep_2(s))
 
             # Update backbone
             new_rotations, new_translations = self.backbone_update(s)
 
+            translations = torch.einsum('bsij, bsj -> bsi', rotations, new_translations) + translations
             rotations = torch.einsum('bsij, bsjk -> bsik', rotations, new_rotations)
-
-            temp = torch.einsum('bsij, bsi -> bsj', new_rotations, translations)
-
-            translations = temp + translations
 
             # Predict side chain and backbone torsion angles
             a = self.angle_linear_1(s) + self.angle_linear_2(single_representation)
@@ -96,6 +90,7 @@ class StructureModule(torch.nn.Module):
             a += self.angle_linear_6(self.relu(self.angle_linear_5(self.relu(a))))
 
             alpha = self.angle_linear_7(self.relu(a))
+            alpha = alpha.reshape(*alpha.shape[:-1], 7, 2)
 
             all_rotations.append(rotations)
             all_translations.append(translations)
@@ -258,14 +253,14 @@ class InvariantPointAttention(torch.nn.Module):
         # output_values: (batch, h, N_res, n_value_points, 3) → (batch, N_res, h, n_value_points, 3)
         output_values = output_values.permute(0, 2, 1, 3, 4)
 
-        # (batch, N_res, h * n_value_points * 3)
-        output_values = output_values.reshape(batch_size, N_res, -1)
-
         # (batch, N_res, h, n_value_points)
-        output_norms = torch.sqrt(torch.sum(output_values ** 2, dim=-1) + 1e-8)  
+        output_norms = torch.sqrt(torch.sum(output_values ** 2, dim=-1) + 1e-8)
 
         # (batch, N_res, h * n_value_points)
         output_norms = output_norms.reshape(batch_size, N_res, -1)
+
+        # (batch, N_res, h * n_value_points * 3)
+        output_values = output_values.reshape(batch_size, N_res, -1)
 
         # output_pair: (batch, N_res, h, c_z) → (batch, N_res, h * c_z)
         output_pair = output_pair.reshape(batch_size, N_res, -1)
@@ -278,6 +273,7 @@ class InvariantPointAttention(torch.nn.Module):
     
 class BackboneUpdate(torch.nn.Module):
     def __init__(self, config):
+        super().__init__()
         self.linear = torch.nn.Linear(in_features=config.c_s, out_features=6)
 
     def forward(self, single_representation: torch.Tensor):
