@@ -39,18 +39,37 @@ class AlphaFoldLoss(torch.nn.Module):
     
 class AuxiliaryLoss(torch.nn.Module):
     def __init__(self):
+        super().__init__()
         self.torsion_angle_loss = TorsionAngleLoss()
         self.fape_loss = FAPELoss()
 
     def forward(
-            self, 
+            self,
             structure_model_prediction: dict,
-            true_rotations: torch.Tensor,
-            true_translation: torch.Tensor,
-            true_atom_positions: torch.Tensor,
-            true_torsion_angles: torch.Tensor,
+            true_rotations: torch.Tensor,          # (b, N_res, 3, 3)
+            true_translations: torch.Tensor,        # (b, N_res, 3)
+            true_torsion_angles: torch.Tensor,      # (b, N_res, 7, 2)
+            true_torsion_angles_alt: torch.Tensor,  # (b, N_res, 7, 2)
         ):
-            pass
+        traj_R = structure_model_prediction["traj_rotations"]          # (L, b, N_res, 3, 3)
+        traj_t = structure_model_prediction["traj_translations"]       # (L, b, N_res, 3)
+        traj_torsions = structure_model_prediction["traj_torsion_angles"]  # (L, b, N_res, 7, 2)
+
+        num_layers = traj_R.shape[0]
+        total_loss = 0.0
+
+        for l in range(num_layers):
+            # Backbone FAPE: use translations as atom positions (CA coordinates)
+            fape = self.fape_loss(
+                traj_R[l], traj_t[l], traj_t[l],
+                true_rotations, true_translations, true_translations,
+            )
+            torsion = self.torsion_angle_loss(
+                traj_torsions[l], true_torsion_angles, true_torsion_angles_alt,
+            ).mean(dim=-1)  # (batch, N_res) -> (batch,)
+            total_loss = total_loss + fape + torsion
+
+        return total_loss / num_layers
 
 class TorsionAngleLoss(torch.nn.Module):
     def __init__(self):
