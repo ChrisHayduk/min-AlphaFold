@@ -95,3 +95,44 @@ class DistogramLoss(torch.nn.Module):
 
         return dist_loss
 
+class MSALoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, msa_preds: torch.Tensor, msa_true: torch.Tensor, msa_mask: torch.Tensor):
+        # msa_preds: (batch, N_seq, N_res, n_msa_classes) — raw logits
+        # msa_true:  (batch, N_seq, N_res, n_msa_classes) — one-hot targets
+        # msa_mask:  (N_seq, N_res) — 1 for masked positions to predict, 0 otherwise
+
+        log_pred = torch.log_softmax(msa_preds, dim=-1)
+
+        # Per-position cross-entropy: (batch, N_seq, N_res)
+        ce = -torch.einsum('bsic, bsic -> bsi', msa_true, log_pred)
+
+        # Apply mask: (N_seq, N_res) -> (1, N_seq, N_res)
+        mask = msa_mask.unsqueeze(0)
+        ce = ce * mask
+
+        # Average over masked positions only
+        N_mask = torch.sum(mask).clamp(min=1)
+        msa_loss = torch.sum(ce, dim=(1, 2)) / N_mask
+
+        return msa_loss
+    
+class ExperimentallyResolvedLoss(torch.nn.Module):
+    def __init__(self, eps=1e-4):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, preds: torch.Tensor, ground_truth: torch.Tensor):
+        # preds shape: (batch, N_res, 14)
+        # groud_truth shape: (batch, N_res, 14) - binary, 1 if atom is exp resolved, 0 if not
+
+        probs = torch.sigmoid(preds)
+
+        log_probs = torch.log(probs + self.eps)
+        log_inv_probs = torch.log(1 - probs + self.eps)
+
+        exp_resolved_loss = torch.mean(- ground_truth * log_probs - (1 - ground_truth) * log_inv_probs, dim=(1,2))
+
+        return exp_resolved_loss
