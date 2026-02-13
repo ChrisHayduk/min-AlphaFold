@@ -136,3 +136,35 @@ class ExperimentallyResolvedLoss(torch.nn.Module):
         exp_resolved_loss = torch.mean(- ground_truth * log_probs - (1 - ground_truth) * log_inv_probs, dim=(1,2))
 
         return exp_resolved_loss
+    
+class StructuralViolationLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self,
+        predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
+        atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
+        residue_types,        # (batch, N_res)         — integer residue type index (0–20)
+    ):
+        return self.bond_length_loss(predicted_positions, atom_mask, residue_types) + self.bond_angle_loss(predicted_positions, atom_mask, residue_types) + self.clash_loss(predicted_positions, atom_mask, residue_types)
+
+    def bond_length_loss(self,
+        predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
+        atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
+        residue_types,        # (batch, N_res)         — integer residue type index (0–20)
+    ):
+        pass
+
+    def bond_angle_loss(self,
+        predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
+        atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
+        residue_types,        # (batch, N_res)         — integer residue type index (0–20)
+    ):
+        pass
+
+    def clash_loss(self,
+        predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
+        atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
+        residue_types,        # (batch, N_res)         — integer residue type index (0–20)
+    ):
+        pass
