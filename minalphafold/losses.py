@@ -64,14 +64,13 @@ class FAPELoss(torch.nn.Module):
         return fape_loss
     
 class PLDDTLoss(torch.nn.Module):
-    def __init__(self, eps=1e-4):
+    def __init__(self):
         super().__init__()
-        self.eps = eps
 
     def forward(self, pred_plddt: torch.Tensor, true_plddt: torch.Tensor):
         # Input shapes: (batch, N_res, n_plddt_bins)
         
-        log_pred = torch.log(pred_plddt + self.eps)
+        log_pred = torch.log_softmax(pred_plddt, dim=-1)
 
         # Per-residue cross-entropy: (batch, N_res)
         conf_loss = -torch.einsum('bic, bic -> bi', true_plddt, log_pred)
@@ -80,3 +79,19 @@ class PLDDTLoss(torch.nn.Module):
         conf_loss = torch.mean(conf_loss, dim=-1)
 
         return conf_loss
+    
+class DistogramLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred_distograms: torch.Tensor, true_distograms: torch.Tensor):
+        # input shapes: (batch, N_res, N_res, num_dist_buckets)
+
+        log_pred = torch.log_softmax(pred_distograms, dim=-1)
+
+        vals = torch.einsum('bijc, bijc -> bij', true_distograms, log_pred)
+
+        dist_loss = - torch.mean(vals, dim=(1,2))
+
+        return dist_loss
+
