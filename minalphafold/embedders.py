@@ -16,50 +16,37 @@ class InputEmbedder(torch.nn.Module):
         self.rel_pos = RelPos(config)
 
     def forward(self, target_feat: torch.Tensor, residue_index: torch.Tensor, msa_feat: torch.Tensor):
-        # target_feat shape: (N_res, 21)
-        # residue_index shape: (N_res)
-        # msa_feat shape: (N_cluster, N_res, 49)
+        # target_feat shape: (batch, N_res, 21)
+        # residue_index shape: (batch, N_res)
+        # msa_feat shape: (batch, N_cluster, N_res, 49)
 
-        # Output shape: (N_res, c_z)
+        # Output shape: (batch, N_res, c_z)
         a = self.linear_target_feat_1(target_feat)
         b = self.linear_target_feat_2(target_feat)
 
-        # Output shape: (N_res, N_res, c_z)
+        # Output shape: (batch, N_res, N_res, c_z)
         # Row i should use element i from a, and col j should use element j from b
-        # Unsqueeze lets us do this
-        z = a.unsqueeze(1) + b.unsqueeze(0)
+        z = a.unsqueeze(-2) + b.unsqueeze(-3)
 
         z += self.rel_pos(residue_index)
 
-        # Output shape: (N_cluster, N_res, c_m)
-        m = self.linear_target_feat_3(target_feat).unsqueeze(0) + self.linear_msa(msa_feat)
+        # Output shape: (batch, N_cluster, N_res, c_m)
+        m = self.linear_target_feat_3(target_feat).unsqueeze(1) + self.linear_msa(msa_feat)
 
         return m, z
 
 class RelPos(torch.nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, max_rel=32):
         super().__init__()
-
-        self.linear = torch.nn.Linear(in_features=config.n_res, out_features=config.c_z)
+        self.max_rel = max_rel
+        self.linear = torch.nn.Linear(2 * max_rel + 1, config.c_z)
 
     def forward(self, residue_index: torch.Tensor):
-        v_bins = torch.arange(-32,33)
-        d = residue_index.unsqueeze(0) - residue_index.unsqueeze(1)
-
-        d.fill_diagonal_(float('inf'))
-
-        p = self.linear(one_hot(d, v_bins))
-
-        return p
-
-def one_hot(x: torch.Tensor, v_bins: torch.Tensor):
-    p = torch.zeros_like(x)
-
-    indices = torch.argmin(torch.abs(x-v_bins),dim=-1)
-
-    p[torch.arange(x.shape[0]), indices] = 1
-
-    return p
+        # residue_index shape: (batch, N_res)
+        d = residue_index[:, :, None] - residue_index[:, None, :]  # (batch, N_res, N_res)
+        d = d.clamp(-self.max_rel, self.max_rel) + self.max_rel
+        oh = torch.nn.functional.one_hot(d.long(), 2 * self.max_rel + 1).float()
+        return self.linear(oh)  # (batch, N_res, N_res, c_z)
 
 class TemplatePair(torch.nn.Module):
     def __init__(self, config):
@@ -102,22 +89,22 @@ class TemplatePair(torch.nn.Module):
 
         for block_idx in range(self.num_blocks):
             pair_representation = pair_representation + dropout_rowwise(
-                self.triangle_mult_out[block_idx](pair_representation),
-                p=self.dropout_p,
-                training=self.training,
-            )
-            pair_representation = pair_representation + dropout_rowwise(
-                self.triangle_mult_in[block_idx](pair_representation),
-                p=self.dropout_p,
-                training=self.training,
-            )
-            pair_representation = pair_representation + dropout_rowwise(
                 self.triangle_att_start[block_idx](pair_representation),
                 p=self.dropout_p,
                 training=self.training,
             )
             pair_representation = pair_representation + dropout_columnwise(
                 self.triangle_att_end[block_idx](pair_representation),
+                p=self.dropout_p,
+                training=self.training,
+            )
+            pair_representation = pair_representation + dropout_rowwise(
+                self.triangle_mult_out[block_idx](pair_representation),
+                p=self.dropout_p,
+                training=self.training,
+            )
+            pair_representation = pair_representation + dropout_rowwise(
+                self.triangle_mult_in[block_idx](pair_representation),
                 p=self.dropout_p,
                 training=self.training,
             )
@@ -390,22 +377,22 @@ class MSAColumnGlobalAttention(torch.nn.Module):
 class MSAColumnAttention(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.layer_norm_msa = torch.nn.LayerNorm(config.c_s)
+        self.layer_norm_msa = torch.nn.LayerNorm(config.c_m)
 
         self.head_dim = config.dim
         self.num_heads = config.num_heads
 
         self.total_dim = self.head_dim * self.num_heads
 
-        self.linear_q = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim, bias=False)
-        self.linear_k = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim, bias=False)
-        self.linear_v = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim, bias=False)
+        self.linear_q = torch.nn.Linear(in_features=config.c_m, out_features=self.total_dim, bias=False)
+        self.linear_k = torch.nn.Linear(in_features=config.c_m, out_features=self.total_dim, bias=False)
+        self.linear_v = torch.nn.Linear(in_features=config.c_m, out_features=self.total_dim, bias=False)
 
-        self.linear_gate = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim)
+        self.linear_gate = torch.nn.Linear(in_features=config.c_m, out_features=self.total_dim)
 
-        self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_s)
+        self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_m)
 
-    def forward(self, msa_representation: torch.Tensor):
+    def forward(self, msa_representation: torch.Tensor, msa_mask: torch.Tensor = None):
         msa_representation = self.layer_norm_msa(msa_representation)
 
         # Shape (batch, N_seq, N_res, self.total_dim)
@@ -428,6 +415,12 @@ class MSAColumnAttention(torch.nn.Module):
         scores = torch.einsum('bsihd, btihd -> bihst', Q, K)
         scores = scores / math.sqrt(self.head_dim)
 
+        # Apply MSA mask to key positions (t dimension = sequences)
+        if msa_mask is not None:
+            # msa_mask: (batch, N_seq, N_res) -> (batch, N_res, 1, 1, N_seq)
+            mask_bias = (1.0 - msa_mask.permute(0, 2, 1)[:, :, None, None, :]) * (-1e9)
+            scores = scores + mask_bias
+
         attention = torch.nn.functional.softmax(scores, dim=-1)
 
         # Shape (batch, N_seq, N_res, self.num_heads, self.head_dim)
@@ -447,10 +440,10 @@ class MSATransition(torch.nn.Module):
         super().__init__()
         self.n = config.msa_transition_n
 
-        self.layer_norm = torch.nn.LayerNorm(config.c_s)
+        self.layer_norm = torch.nn.LayerNorm(config.c_m)
 
-        self.linear_up = torch.nn.Linear(in_features=config.c_s, out_features=self.n*config.c_s)
-        self.linear_down = torch.nn.Linear(in_features=config.c_s*self.n, out_features=config.c_s)
+        self.linear_up = torch.nn.Linear(in_features=config.c_m, out_features=self.n*config.c_m)
+        self.linear_down = torch.nn.Linear(in_features=config.c_m*self.n, out_features=config.c_m)
 
     def forward(self, msa_representation: torch.Tensor):
         msa_representation = self.layer_norm(msa_representation)
@@ -462,12 +455,12 @@ class MSATransition(torch.nn.Module):
 class OuterProductMean(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.layer_norm = torch.nn.LayerNorm(config.c_s)
+        self.layer_norm = torch.nn.LayerNorm(config.c_m)
 
         self.c = config.outer_product_dim
 
-        self.linear_left = torch.nn.Linear(config.c_s, self.c)
-        self.linear_right = torch.nn.Linear(config.c_s, self.c)
+        self.linear_left = torch.nn.Linear(config.c_m, self.c)
+        self.linear_right = torch.nn.Linear(config.c_m, self.c)
 
         self.linear_out = torch.nn.Linear(in_features=self.c*self.c, out_features=config.c_z)
 
@@ -585,7 +578,7 @@ class TriangleAttentionStartingNode(torch.nn.Module):
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
 
-    def forward(self, pair_representation: torch.Tensor):
+    def forward(self, pair_representation: torch.Tensor, pair_mask: torch.Tensor = None):
         pair_representation = self.layer_norm(pair_representation)
 
         # Shape (batch, N_res, N_res, self.total_dim)
@@ -613,6 +606,12 @@ class TriangleAttentionStartingNode(torch.nn.Module):
         # Output shape (batch, N_res_i, N_res_j, N_res_k, self.num_heads)
         scores = torch.einsum('bijhd, bikhd -> bijkh', Q, K)
         scores = scores / math.sqrt(self.head_dim) + B.unsqueeze(1)
+
+        # Apply pair mask to key positions (k dimension, for a given i)
+        if pair_mask is not None:
+            # pair_mask: (batch, N_res, N_res) -> (batch, N_res_i, 1, N_res_k, 1)
+            mask_bias = (1.0 - pair_mask[:, :, None, :, None]) * (-1e9)
+            scores = scores + mask_bias
 
         attention = torch.nn.functional.softmax(scores, dim=3)
 
@@ -647,7 +646,7 @@ class TriangleAttentionEndingNode(torch.nn.Module):
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
 
-    def forward(self, pair_representation: torch.Tensor):
+    def forward(self, pair_representation: torch.Tensor, pair_mask: torch.Tensor = None):
         pair_representation = self.layer_norm(pair_representation)
 
         # Shape (batch, N_res, N_res, self.total_dim)
@@ -676,6 +675,13 @@ class TriangleAttentionEndingNode(torch.nn.Module):
 
         scores = torch.einsum('bijhd, bkjhd -> bijkh', Q, K)
         scores = scores / math.sqrt(self.head_dim) + B.unsqueeze(2)
+
+        # Apply pair mask to key positions (k dimension, for a given j)
+        if pair_mask is not None:
+            # pair_mask: (batch, N_res, N_res) -> (batch, 1, N_res_j, N_res_k, 1)
+            # pair_mask[b,k,j] = valid -> permute to (batch, j, k) then reshape
+            mask_bias = (1.0 - pair_mask.permute(0, 2, 1)[:, None, :, :, None]) * (-1e9)
+            scores = scores + mask_bias
 
         attention = torch.nn.functional.softmax(scores, dim=3)
 

@@ -64,17 +64,17 @@ class StructureModule(torch.nn.Module):
         alpha = torch.zeros(s.shape[0], s.shape[1], 7, 2, device=s.device, dtype=s.dtype)
 
         for l in range(self.num_layers):
-            # Stop rotation gradients between iterations
+            # Stop rigid frame gradients between iterations (both R and t)
             if l < self.num_layers - 1:
                 rotations = rotations.detach()
+                translations = translations.detach()
 
-            s += self.IPA(s, pair_representation, rotations, translations)
+            # Pre-norm residual pattern: LN on sublayer input, dropout on sublayer output
+            s = s + self.dropout_1(self.IPA(self.layer_norm_single_rep_3(s), pair_representation, rotations, translations))
 
-            s = self.dropout_1(self.layer_norm_single_rep_3(s))
-
-            # Transition
-            s += self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s)))))
-            s = self.dropout_2(self.layer_norm_single_rep_2(s))
+            # Transition with pre-norm
+            s_norm = self.layer_norm_single_rep_2(s)
+            s = s + self.dropout_2(self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s_norm))))))
 
             # Update backbone
             new_rotations, new_translations = self.backbone_update(s)
@@ -329,8 +329,9 @@ class BackboneUpdate(torch.nn.Module):
         return R, t
     
 def make_rot_x(alpha: torch.Tensor):
-    a1 = alpha[..., 0]
-    a2 = alpha[..., 1]
+    # alpha is (sin, cos) pairs; extract cos and sin for rotation matrix
+    a1 = alpha[..., 1]  # cos
+    a2 = alpha[..., 0]  # sin
 
     zeros = torch.zeros_like(a1)
     ones = torch.ones_like(a1)
@@ -429,6 +430,6 @@ def compute_all_atom_coordinates(
     atom_t = torch.gather(all_frames_t, 2, idx_t)  # (batch, N_res, 14, 3)
 
     # x_global = R_frame @ x_lit + t_frame
-    atom_coords = torch.einsum('bnaji, bnaj -> bnai', atom_R, lit_pos) + atom_t
+    atom_coords = torch.einsum('bnaij, bnaj -> bnai', atom_R, lit_pos) + atom_t
 
     return all_frames_R, all_frames_t, atom_coords, mask
