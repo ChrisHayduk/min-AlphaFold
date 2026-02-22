@@ -1,12 +1,23 @@
 import torch
 from utils import distance_bin
+from structure_module import compute_all_atom_coordinates
 from residue_constants import (
     between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
     between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
+    chi_angles_mask,
+    restype_atom14_mask,
+    restype_atom14_rigid_group_positions,
+    restype_atom14_to_rigid_group,
+    restype_rigid_group_default_frame,
     restype_atom14_vdw_radius,
 )
 
 class AlphaFoldLoss(torch.nn.Module):
+    default_frames: torch.Tensor
+    lit_positions: torch.Tensor
+    atom_frame_idx_table: torch.Tensor
+    atom_mask_table: torch.Tensor
+
     def __init__(self, finetune = False):
         super().__init__()
         self.torsion_angle_loss = TorsionAngleLoss()
@@ -17,6 +28,11 @@ class AlphaFoldLoss(torch.nn.Module):
         self.structural_violation_loss = StructuralViolationLoss()
         self.aux_loss = AuxiliaryLoss()
         self.fape_loss = AllAtomFAPE()
+
+        self.register_buffer("default_frames", torch.tensor(restype_rigid_group_default_frame))
+        self.register_buffer("lit_positions", torch.tensor(restype_atom14_rigid_group_positions))
+        self.register_buffer("atom_frame_idx_table", torch.tensor(restype_atom14_to_rigid_group))
+        self.register_buffer("atom_mask_table", torch.tensor(restype_atom14_mask))
 
         self.finetune = finetune
 
@@ -36,14 +52,25 @@ class AlphaFoldLoss(torch.nn.Module):
             distogram_pred: torch.Tensor,
             res_types: torch.Tensor,                # (b, N_res) integer 0-20
         ):
-        final_rotations = structure_model_prediction["traj_rotations"][-1]      # (batch, N_res, 3, 3)
-        final_translations = structure_model_prediction["traj_translations"][-1]  # (batch, N_res, 3)
+        pred_all_frames_R = structure_model_prediction["all_frames_R"]  # (batch, N_res, 8, 3, 3)
+        pred_all_frames_t = structure_model_prediction["all_frames_t"]  # (batch, N_res, 8, 3)
         atom_coords = structure_model_prediction["atom14_coords"]   # (batch, N_res, 14, 3)
         atom_mask = structure_model_prediction["atom14_mask"]       # (batch, N_res, 14)
 
+        true_all_frames_R, true_all_frames_t, _, _ = compute_all_atom_coordinates(
+            true_translations,
+            true_rotations,
+            true_torsion_angles,
+            res_types,
+            self.default_frames,
+            self.lit_positions,
+            self.atom_frame_idx_table,
+            self.atom_mask_table,
+        )
+
         fape_loss = self.fape_loss(
-                final_rotations, final_translations, atom_coords, atom_mask,
-                true_rotations, true_translations, true_atom_positions,
+                pred_all_frames_R, pred_all_frames_t, atom_coords, atom_mask,
+                true_all_frames_R, true_all_frames_t, true_atom_positions,
             )
 
         # --- Derive true_torsion_angles_alt ---
@@ -60,7 +87,7 @@ class AlphaFoldLoss(torch.nn.Module):
             chi3_sym, -true_torsion_angles[:, :, 5, :], true_torsion_angles[:, :, 5, :])
 
         aux_loss = self.aux_loss(structure_model_prediction, true_rotations, true_translations,
-                                 true_torsion_angles, true_torsion_angles_alt)
+                                 true_torsion_angles, true_torsion_angles_alt, res_types)
 
         # --- Derive distogram_true ---
         # CB-CB distances (CA for GLY) binned into distance buckets
@@ -124,13 +151,14 @@ class AuxiliaryLoss(torch.nn.Module):
             true_translations: torch.Tensor,        # (b, N_res, 3)
             true_torsion_angles: torch.Tensor,      # (b, N_res, 7, 2)
             true_torsion_angles_alt: torch.Tensor,  # (b, N_res, 7, 2)
+            res_types: torch.Tensor,                # (b, N_res)
         ):
         traj_R = structure_model_prediction["traj_rotations"]          # (L, b, N_res, 3, 3)
         traj_t = structure_model_prediction["traj_translations"]       # (L, b, N_res, 3)
         traj_torsions = structure_model_prediction["traj_torsion_angles"]  # (L, b, N_res, 7, 2)
 
         num_layers = traj_R.shape[0]
-        total_loss = 0.0
+        total_loss = torch.zeros(traj_R.shape[1], device=traj_R.device, dtype=traj_R.dtype)
 
         for l in range(num_layers):
             # Backbone FAPE: use translations as atom positions (CA coordinates)
@@ -139,30 +167,45 @@ class AuxiliaryLoss(torch.nn.Module):
                 true_rotations, true_translations, true_translations,
             )
             torsion = self.torsion_angle_loss(
-                traj_torsions[l], true_torsion_angles, true_torsion_angles_alt,
-            ).mean(dim=-1)  # (batch, N_res) -> (batch,)
+                traj_torsions[l], true_torsion_angles, true_torsion_angles_alt, res_types,
+            )
             total_loss = total_loss + fape + torsion
 
         return total_loss / num_layers
 
 class TorsionAngleLoss(torch.nn.Module):
+    chi_mask_table: torch.Tensor
+
     def __init__(self):
         super().__init__()
+        self.register_buffer(
+            "chi_mask_table",
+            torch.tensor(chi_angles_mask + [[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        )
 
-    def forward(self, torsion_angles: torch.Tensor, torsion_angles_true: torch.Tensor, torsion_angles_true_alt: torch.Tensor):
+    def forward(
+        self,
+        torsion_angles: torch.Tensor,
+        torsion_angles_true: torch.Tensor,
+        torsion_angles_true_alt: torch.Tensor,
+        res_types: torch.Tensor,
+    ):
         # torsion_angles shape: (batch, N_res, 7, 2)
 
-        norm = torch.sqrt(torch.sum(torsion_angles**2, dim=-1, keepdim=True) + 1e-8)
+        norm = torch.sqrt(torch.sum(torsion_angles ** 2, dim=-1) + 1e-8)  # (batch, N_res, 7)
+        pred_unit = torsion_angles / norm[..., None]  # (batch, N_res, 7, 2)
 
-        torsion_angles = torsion_angles / norm
+        true_dist_sq = torch.sum((torsion_angles_true - pred_unit) ** 2, dim=-1)  # (batch, N_res, 7)
+        alt_true_dist_sq = torch.sum((torsion_angles_true_alt - pred_unit) ** 2, dim=-1)  # (batch, N_res, 7)
+        torsion_dist_sq = torch.minimum(true_dist_sq, alt_true_dist_sq)
 
-        true_dist = torch.sqrt(torch.sum((torsion_angles_true - torsion_angles)**2, dim=-1, keepdim=True) + 1e-8)
+        chi_mask = self.chi_mask_table[res_types.long()].to(torsion_angles.dtype)  # (batch, N_res, 4)
+        backbone_mask = torch.ones_like(chi_mask[..., :3])  # (batch, N_res, 3)
+        torsion_mask = torch.cat([backbone_mask, chi_mask], dim=-1)  # (batch, N_res, 7)
+        normalizer = torsion_mask.sum(dim=(1, 2)).clamp(min=1.0)  # (batch,)
 
-        alt_true_dist = torch.sqrt(torch.sum((torsion_angles_true_alt - torsion_angles)**2, dim=-1, keepdim=True) + 1e-8)
-
-        torsion_loss = torch.mean(torch.minimum(true_dist, alt_true_dist), dim=(2, 3))
-
-        angle_norm_loss = torch.mean(torch.abs(norm - 1), dim=(2, 3))
+        torsion_loss = torch.sum(torsion_dist_sq * torsion_mask, dim=(1, 2)) / normalizer
+        angle_norm_loss = torch.sum(torch.abs(norm - 1.0) * torsion_mask, dim=(1, 2)) / normalizer
 
         return torsion_loss + 0.02 * angle_norm_loss
     
@@ -216,35 +259,40 @@ class AllAtomFAPE(torch.nn.Module):
         self.Z = Z
 
     def forward(self,
-                predicted_rotations,      # (b, N_res, 3, 3)
-                predicted_translations,   # (b, N_res, 3)
+                predicted_frames_R,       # (b, N_res, 8, 3, 3)
+                predicted_frames_t,       # (b, N_res, 8, 3)
                 predicted_atom_positions, # (b, N_res, 14, 3)
                 atom_mask,                # (b, N_res, 14)
-                true_rotations,           # (b, N_res, 3, 3)
-                true_translations,        # (b, N_res, 3)
+                true_frames_R,            # (b, N_res, 8, 3, 3)
+                true_frames_t,            # (b, N_res, 8, 3)
                 true_atom_positions,      # (b, N_res, 14, 3)
     ):
-        b, N_res = predicted_rotations.shape[:2]
+        b, N_res, n_frames = predicted_frames_R.shape[:3]
+        n_atoms = predicted_atom_positions.shape[2]
+
+        # Flatten rigid-group frames and atoms.
+        pred_R = predicted_frames_R.reshape(b, N_res * n_frames, 3, 3)
+        pred_t = predicted_frames_t.reshape(b, N_res * n_frames, 3)
+        true_R = true_frames_R.reshape(b, N_res * n_frames, 3, 3)
+        true_t = true_frames_t.reshape(b, N_res * n_frames, 3)
 
         # Flatten atoms: (b, N_res*14, 3) and mask: (b, N_res*14)
-        pred_pos = predicted_atom_positions.reshape(b, N_res * 14, 3)
-        true_pos = true_atom_positions.reshape(b, N_res * 14, 3)
-        mask = atom_mask.reshape(b, N_res * 14)
+        pred_pos = predicted_atom_positions.reshape(b, N_res * n_atoms, 3)
+        true_pos = true_atom_positions.reshape(b, N_res * n_atoms, 3)
+        mask = atom_mask.reshape(b, N_res * n_atoms)
 
         # Predicted inverse frames
-        R_pred_inv = predicted_rotations.transpose(-1, -2)
-        t_pred_inv = -torch.einsum('birc, bic -> bir', R_pred_inv, predicted_translations)
+        R_pred_inv = pred_R.transpose(-1, -2)
+        t_pred_inv = -torch.einsum('bfij, bfj -> bfi', R_pred_inv, pred_t)
 
         # True inverse frames
-        R_true_inv = true_rotations.transpose(-1, -2)
-        t_true_inv = -torch.einsum('birc, bic -> bir', R_true_inv, true_translations)
+        R_true_inv = true_R.transpose(-1, -2)
+        t_true_inv = -torch.einsum('bfij, bfj -> bfi', R_true_inv, true_t)
 
         # Project all atoms through all frames
         # Result: (b, N_frames, N_atoms, 3)
-        x_frames_pred = torch.einsum('biop, bjp -> bijo', R_pred_inv, pred_pos) \
-                         + t_pred_inv[:, :, None, :]
-        x_frames_true = torch.einsum('biop, bjp -> bijo', R_true_inv, true_pos) \
-                         + t_true_inv[:, :, None, :]
+        x_frames_pred = torch.einsum('bfij, baj -> bfai', R_pred_inv, pred_pos) + t_pred_inv[:, :, None, :]
+        x_frames_true = torch.einsum('bfij, baj -> bfai', R_true_inv, true_pos) + t_true_inv[:, :, None, :]
 
         # Distance: (b, N_frames, N_atoms)
         dist = torch.sqrt(
@@ -256,8 +304,8 @@ class AllAtomFAPE(torch.nn.Module):
 
         # Masked average over atoms, then average over frames
         # mask: (b, N_atoms) -> broadcast over frames
-        n_atoms = mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (b, 1)
-        frame_means = (dist_clamped * mask[:, None, :]).sum(dim=-1) / n_atoms  # (b, N_frames)
+        atom_count = mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (b, 1)
+        frame_means = (dist_clamped * mask[:, None, :]).sum(dim=-1) / atom_count  # (b, N_frames)
         fape_loss = frame_means.mean(dim=-1) / self.Z  # (b,)
 
         return fape_loss
@@ -331,8 +379,11 @@ class ExperimentallyResolvedLoss(torch.nn.Module):
         ).mean(dim=(1, 2))
     
 class StructuralViolationLoss(torch.nn.Module):
+    vdw_table: torch.Tensor
+
     def __init__(self):
         super().__init__()
+        self.register_buffer('vdw_table', torch.tensor(restype_atom14_vdw_radius))
 
     def forward(
         self,
@@ -425,11 +476,10 @@ class StructuralViolationLoss(torch.nn.Module):
         pos_flat = predicted_positions.reshape(batch, N_res * 14, 3)
         mask_flat = atom_mask.reshape(batch, N_res * 14)
 
-        # VDW radii per atom: look up from precomputed table
+        # VDW radii per atom: look up from registered buffer
         # residue_types: (batch, N_res) -> vdw: (batch, N_res, 14)
-        vdw_table = torch.tensor(restype_atom14_vdw_radius, device=predicted_positions.device)
         residue_types_clamped = residue_types.clamp(max=20)
-        vdw = vdw_table[residue_types_clamped]  # (batch, N_res, 14)
+        vdw = self.vdw_table[residue_types_clamped]  # (batch, N_res, 14)
         vdw_flat = vdw.reshape(batch, N_res * 14)  # (batch, N_res*14)
 
         # Pairwise distances: (batch, N_res*14, N_res*14)

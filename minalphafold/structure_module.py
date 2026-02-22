@@ -8,6 +8,11 @@ from residue_constants import (
 )
 
 class StructureModule(torch.nn.Module):
+    default_frames: torch.Tensor
+    lit_positions: torch.Tensor
+    atom_frame_idx_table: torch.Tensor
+    atom_mask_table: torch.Tensor
+
     def __init__(self, config):
         super().__init__()
         self.c = config.structure_module_c
@@ -20,9 +25,19 @@ class StructureModule(torch.nn.Module):
 
         self.layer_norm_pair_rep = torch.nn.LayerNorm(config.c_z)
 
-        # Dropouts
-        self.dropout_1 = torch.nn.Dropout(p=0.1)
-        self.dropout_2 = torch.nn.Dropout(p=0.2)
+        # Dropouts (rates from config)
+        self.dropout_1 = torch.nn.Dropout(p=config.structure_module_dropout_ipa)
+        self.dropout_2 = torch.nn.Dropout(p=config.structure_module_dropout_transition)
+
+        # Register residue constant tensors as buffers (avoid device bugs, improve speed)
+        self.register_buffer('default_frames',
+            torch.tensor(restype_rigid_group_default_frame))   # (21, 8, 4, 4)
+        self.register_buffer('lit_positions',
+            torch.tensor(restype_atom14_rigid_group_positions)) # (21, 14, 3)
+        self.register_buffer('atom_frame_idx_table',
+            torch.tensor(restype_atom14_to_rigid_group))        # (21, 14)
+        self.register_buffer('atom_mask_table',
+            torch.tensor(restype_atom14_mask))                  # (21, 14)
 
         # Linear layers
         self.single_rep_proj = torch.nn.Linear(in_features=config.c_s, out_features=config.c_s)
@@ -47,6 +62,15 @@ class StructureModule(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor, aatype: torch.Tensor):
+        assert single_representation.ndim == 3, \
+            f"single_representation must be (batch, N_res, c_s), got {single_representation.shape}"
+        assert pair_representation.ndim == 4, \
+            f"pair_representation must be (batch, N_res, N_res, c_z), got {pair_representation.shape}"
+        assert aatype.ndim == 2, \
+            f"aatype must be (batch, N_res), got {aatype.shape}"
+        assert single_representation.shape[1] == pair_representation.shape[1] == pair_representation.shape[2] == aatype.shape[1], \
+            f"N_res mismatch: single={single_representation.shape[1]}, pair={pair_representation.shape[1:3]}, aatype={aatype.shape[1]}"
+
         single_representation = self.layer_norm_single_rep_1(single_representation)
 
         pair_representation = self.layer_norm_pair_rep(pair_representation)
@@ -105,16 +129,12 @@ class StructureModule(torch.nn.Module):
             translations,
             rotations,
             alpha,
-            aatype
+            aatype,
+            self.default_frames,
+            self.lit_positions,
+            self.atom_frame_idx_table,
+            self.atom_mask_table,
         )
-
-        # Concat backbone frame T_i with per-group frames T_i^f
-        # all_frames already has backbone as frame 0, but we prepend the standalone
-        # backbone frame so the FAPE loss can address it separately (9 frames total)
-        backbone_R = rotations.unsqueeze(2)      # (batch, N_res, 1, 3, 3)
-        backbone_t = translations.unsqueeze(2)    # (batch, N_res, 1, 3)
-        all_frames_R = torch.cat([backbone_R, all_frames_R], dim=2)  # (batch, N_res, 9, 3, 3)
-        all_frames_t = torch.cat([backbone_t, all_frames_t], dim=2)  # (batch, N_res, 9, 3)
 
         predictions = {
             # Per-layer backbone frames for auxiliary FAPE loss
@@ -128,9 +148,9 @@ class StructureModule(torch.nn.Module):
             "final_rotations": rotations,              # (batch, N_res, 3, 3)
             "final_translations": translations,        # (batch, N_res, 3)
 
-            # Final all-atom outputs (frames include backbone + 8 groups = 9 total)
-            "all_frames_R": all_frames_R,              # (batch, N_res, 9, 3, 3)
-            "all_frames_t": all_frames_t,              # (batch, N_res, 9, 3)
+            # Final all-atom outputs (8 rigid-group frames including backbone frame 0)
+            "all_frames_R": all_frames_R,              # (batch, N_res, 8, 3, 3)
+            "all_frames_t": all_frames_t,              # (batch, N_res, 8, 3)
             "atom14_coords": atom_coords,            # (batch, N_res, 14, 3)
             "atom14_mask": mask,                # (batch, N_res, 14)
 
@@ -178,6 +198,10 @@ class InvariantPointAttention(torch.nn.Module):
         # pair_rep shape: (batch, N_res, N_res, c_z)
         # rotations shape: (batch, N_res, 3, 3)
         # translations shape: (batch, N_res, 3)
+        assert rotations.shape[-2:] == (3, 3), \
+            f"rotations must end with (3, 3), got {rotations.shape}"
+        assert translation.shape[-1] == 3, \
+            f"translation must end with (3,), got {translation.shape}"
 
         batch_size = single_representation.shape[0]
         N_res = single_representation.shape[1]
@@ -225,7 +249,7 @@ class InvariantPointAttention(torch.nn.Module):
         rep_scores = torch.einsum('bihd, bjhd -> bijh', Q_rep, K_rep) / math.sqrt(self.head_dim) + B
 
         # Shape (batch, N_res, N_res, self.num_heads)
-        scores = self.w_l * (rep_scores + point_scores)
+        scores = self.w_l * rep_scores + point_scores
 
         # Shape (batch, N_res, N_res, self.num_heads)
         attention = torch.nn.functional.softmax(scores, dim=-2)
@@ -358,18 +382,18 @@ def compute_all_atom_coordinates(
     rotations: torch.Tensor,      # (batch, N_res, 3, 3)
     torsion_angles: torch.Tensor, # (batch, N_res, 7, 2) — [ω, φ, ψ, χ1, χ2, χ3, χ4]
     aatype: torch.Tensor,         # (batch, N_res) — integer residue type indices
+    default_frames: torch.Tensor, # (21, 8, 4, 4) — registered buffer
+    lit_positions: torch.Tensor,  # (21, 14, 3) — registered buffer
+    atom_frame_idx_table: torch.Tensor,  # (21, 14) — registered buffer
+    atom_mask_table: torch.Tensor,       # (21, 14) — registered buffer
 ):
-    device = translations.device
     dtype = translations.dtype
 
     # --- Step 1: Normalize torsion angles to unit vectors ---
     torsion_angles = torsion_angles / (torch.norm(torsion_angles, dim=-1, keepdim=True) + 1e-8)
 
     # --- Step 2: Get literature constants, indexed by residue type ---
-    default_frames = torch.tensor(
-        restype_rigid_group_default_frame, device=device, dtype=dtype
-    )  # (21, 8, 4, 4)
-    lit_all = default_frames[aatype]          # (batch, N_res, 8, 4, 4)
+    lit_all = default_frames.to(dtype)[aatype]  # (batch, N_res, 8, 4, 4)
     lit_R = lit_all[..., :3, :3]              # (batch, N_res, 8, 3, 3)
     lit_t = lit_all[..., :3, 3]               # (batch, N_res, 8, 3)
 
@@ -410,17 +434,9 @@ def compute_all_atom_coordinates(
     all_frames_t = torch.stack(frames_t, dim=2)  # (batch, N_res, 8, 3)
 
     # --- Step 5: Place atoms using their frame assignments ---
-    lit_pos = torch.tensor(
-        restype_atom14_rigid_group_positions, device=device, dtype=dtype
-    )[aatype]  # (batch, N_res, 14, 3)
-
-    atom_frame_idx = torch.tensor(
-        restype_atom14_to_rigid_group, device=device, dtype=torch.long
-    )[aatype]  # (batch, N_res, 14)
-
-    mask = torch.tensor(
-        restype_atom14_mask, device=device, dtype=dtype
-    )[aatype]  # (batch, N_res, 14)
+    lit_pos = lit_positions.to(dtype)[aatype]         # (batch, N_res, 14, 3)
+    atom_frame_idx = atom_frame_idx_table[aatype]     # (batch, N_res, 14)
+    mask = atom_mask_table.to(dtype)[aatype]           # (batch, N_res, 14)
 
     # Gather the correct frame for each atom
     idx_R = atom_frame_idx[:, :, :, None, None].expand(-1, -1, -1, 3, 3)

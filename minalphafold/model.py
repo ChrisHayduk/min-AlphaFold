@@ -1,9 +1,10 @@
 import torch
+import math
+from typing import cast
 from evoformer import Evoformer
 from structure_module import StructureModule
 from embedders import InputEmbedder, TemplatePair, TemplatePointwiseAttention, ExtraMsaStack
 from utils import distance_bin
-from random import randint
 
 class AlphaFold2(torch.nn.Module):
     def __init__(self, config):
@@ -38,6 +39,63 @@ class AlphaFold2(torch.nn.Module):
         )
 
         self.config = config
+        self._initialize_alphafold_parameters()
+
+    @staticmethod
+    def _zero_linear(linear: torch.nn.Linear):
+        torch.nn.init.zeros_(linear.weight)
+        if linear.bias is not None:
+            torch.nn.init.zeros_(linear.bias)
+
+    @staticmethod
+    def _init_gate_linear(linear: torch.nn.Linear):
+        torch.nn.init.zeros_(linear.weight)
+        if linear.bias is not None:
+            torch.nn.init.ones_(linear.bias)
+
+    def _initialize_alphafold_parameters(self):
+        output_zero_init_classes = {
+            "MSARowAttentionWithPairBias",
+            "MSAColumnAttention",
+            "MSAColumnGlobalAttention",
+            "TemplatePointwiseAttention",
+            "ExtraMsaStack",
+            "TriangleAttentionStartingNode",
+            "TriangleAttentionEndingNode",
+            "InvariantPointAttention",
+        }
+        transition_zero_init_classes = {"MSATransition", "PairTransition"}
+
+        for module in self.modules():
+            class_name = module.__class__.__name__
+
+            if hasattr(module, "linear_gate") and isinstance(module.linear_gate, torch.nn.Linear):
+                self._init_gate_linear(module.linear_gate)
+
+            if class_name in output_zero_init_classes and hasattr(module, "linear_output"):
+                self._zero_linear(cast(torch.nn.Linear, module.linear_output))
+
+            if class_name in transition_zero_init_classes and hasattr(module, "linear_down"):
+                self._zero_linear(cast(torch.nn.Linear, module.linear_down))
+
+            if class_name == "OuterProductMean" and hasattr(module, "linear_out"):
+                self._zero_linear(cast(torch.nn.Linear, module.linear_out))
+
+            if class_name in {"TriangleMultiplicationOutgoing", "TriangleMultiplicationIncoming"}:
+                self._init_gate_linear(cast(torch.nn.Linear, module.gate1))
+                self._init_gate_linear(cast(torch.nn.Linear, module.gate2))
+                self._init_gate_linear(cast(torch.nn.Linear, module.gate))
+                self._zero_linear(cast(torch.nn.Linear, module.out_linear))
+
+            if class_name == "StructureModule":
+                self._zero_linear(cast(torch.nn.Linear, module.transition_linear_3))
+
+            if class_name == "BackboneUpdate":
+                self._zero_linear(cast(torch.nn.Linear, module.linear))
+
+            if class_name == "InvariantPointAttention":
+                # Set head weights so softplus(head_weights) = 1 at init.
+                cast(torch.nn.Parameter, module.head_weights).data.fill_(math.log(math.e - 1.0))
 
     def forward(
             self,
@@ -47,6 +105,8 @@ class AlphaFold2(torch.nn.Module):
             extra_msa_feat: torch.Tensor,
             template_pair_feat: torch.Tensor,
             aatype: torch.Tensor,
+            template_angle_feat: torch.Tensor | None = None,
+            template_mask: torch.Tensor | None = None,
             n_cycles: int = 3,
             n_ensemble: int = 1,
         ):
@@ -54,7 +114,7 @@ class AlphaFold2(torch.nn.Module):
         assert(n_cycles > 0)
 
         if self.training:
-            n_cycles = randint(1, 4)
+            n_cycles = int(torch.randint(1, 5, (1,), device=target_feat.device).item())
 
         outer_grad = torch.is_grad_enabled()
 
@@ -75,6 +135,13 @@ class AlphaFold2(torch.nn.Module):
                 # Ensemble: accumulate non-MSA representations and average
                 single_rep_accum = torch.zeros(batch_size, N_res, c_m, device=msa_feat.device)
                 pair_repr_accum = torch.zeros(batch_size, N_res, N_res, c_z, device=msa_feat.device)
+                msa_repr_accum = torch.zeros(
+                    batch_size,
+                    msa_feat.shape[1],
+                    N_res,
+                    c_m,
+                    device=msa_feat.device,
+                )
 
                 msa_repr = None  # will be set by ensemble loop (n_ensemble > 0)
                 for _ in range(n_ensemble):
@@ -87,25 +154,38 @@ class AlphaFold2(torch.nn.Module):
                     pair_repr += self.recycle_linear_z(self.recycle_norm_z(z_prev))
                     pair_repr += self.recycle_linear_d(distance_bin(x_prev, self.config.n_dist_bins))
 
+                    # Template processing
+                    template_pair = self.template_pair_feat_linear(template_pair_feat)
+                    template_pair = self.template_pair_stack(template_pair)
+                    pair_repr = pair_repr + self.template_pointwise_att(
+                        template_pair,
+                        pair_repr,
+                        template_mask=template_mask,
+                    )
+
+                    # Template torsion-angle features are appended as extra MSA rows.
+                    if template_angle_feat is not None:
+                        template_angle_repr = self.template_angle_linear_2(
+                            torch.relu(self.template_angle_linear_1(template_angle_feat))
+                        )
+                        msa_repr = torch.cat([msa_repr, template_angle_repr], dim=1)
+
                     # Extra MSA processing
                     extra_msa_repr = self.extra_msa_feat_linear(extra_msa_feat)
                     for extra_block in self.extra_msa_blocks:
                         extra_msa_repr, pair_repr = extra_block(extra_msa_repr, pair_repr)
-
-                    # Template processing
-                    template_pair = self.template_pair_feat_linear(template_pair_feat)
-                    template_pair = self.template_pair_stack(template_pair)
-                    pair_repr = pair_repr + self.template_pointwise_att(template_pair, pair_repr)
 
                     for block in self.evoformer_blocks:
                         msa_repr, pair_repr = block(msa_repr, pair_repr)
 
                     single_rep_accum += msa_repr[:, 0, :, :]
                     pair_repr_accum += pair_repr
+                    msa_repr_accum += msa_repr[:, :msa_feat.shape[1], :, :]
 
                 # Average across ensemble members
                 msa_first_row = single_rep_accum / n_ensemble
                 pair_repr = pair_repr_accum / n_ensemble
+                msa_repr = msa_repr_accum / n_ensemble
 
                 single_rep = self.single_rep_proj(msa_first_row)
 
@@ -127,4 +207,4 @@ class AlphaFold2(torch.nn.Module):
                     cb_idx[:, :, None, None].expand(-1, -1, 1, 3),
                 ).squeeze(2).detach()
 
-        raise ValueError("n_cycles must be >= 0")
+        raise ValueError("n_cycles and n_ensemble must be > 0")

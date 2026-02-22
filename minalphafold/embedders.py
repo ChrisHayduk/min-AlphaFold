@@ -1,5 +1,6 @@
 import torch
 import math
+from typing import Optional
 from utils import dropout_columnwise, dropout_rowwise
 
 class InputEmbedder(torch.nn.Module):
@@ -19,6 +20,12 @@ class InputEmbedder(torch.nn.Module):
         # target_feat shape: (batch, N_res, 21)
         # residue_index shape: (batch, N_res)
         # msa_feat shape: (batch, N_cluster, N_res, 49)
+        assert target_feat.ndim == 3 and target_feat.shape[-1] == 21, \
+            f"target_feat must be (batch, N_res, 21), got {target_feat.shape}"
+        assert residue_index.ndim == 2, \
+            f"residue_index must be (batch, N_res), got {residue_index.shape}"
+        assert msa_feat.ndim == 4 and msa_feat.shape[-1] == 49, \
+            f"msa_feat must be (batch, N_cluster, N_res, 49), got {msa_feat.shape}"
 
         # Output shape: (batch, N_res, c_z)
         a = self.linear_target_feat_1(target_feat)
@@ -73,6 +80,7 @@ class TemplatePair(torch.nn.Module):
         self.pair_transition = torch.nn.ModuleList(
             [PairTransition(config) for _ in range(self.num_blocks)]
         )
+        self.final_layer_norm = torch.nn.LayerNorm(config.c_z)
 
     def forward(self, template_feat: torch.Tensor):
         # template_feat shape: (batch, N_templates, N_res, N_res, c_t)
@@ -110,6 +118,8 @@ class TemplatePair(torch.nn.Module):
             )
             pair_representation = pair_representation + self.pair_transition[block_idx](pair_representation)
 
+        pair_representation = self.final_layer_norm(pair_representation)
+
         # Restore batch and template dims
         # Output shape: (batch, N_templates, N_res, N_res, c_z)
         pair_representation = pair_representation.reshape(b, t, n_i, n_j, c)
@@ -120,9 +130,6 @@ class TemplatePointwiseAttention(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
-        self.layer_norm_template = torch.nn.LayerNorm(config.c_z)
-
         self.head_dim = config.template_pointwise_attention_dim
         self.num_heads = config.template_pointwise_num_heads
 
@@ -132,25 +139,25 @@ class TemplatePointwiseAttention(torch.nn.Module):
         self.linear_k = torch.nn.Linear(in_features=config.c_z, out_features=self.total_dim, bias=False)
         self.linear_v = torch.nn.Linear(in_features=config.c_z, out_features=self.total_dim, bias=False)
 
-        self.linear_gate = torch.nn.Linear(in_features=config.c_z, out_features=self.total_dim)
-
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
 
-    def forward(self, template_feat: torch.Tensor, pair_representation: torch.Tensor):
+    def forward(
+        self,
+        template_feat: torch.Tensor,
+        pair_representation: torch.Tensor,
+        template_mask: Optional[torch.Tensor] = None,
+    ):
         # template_feat shape: (batch, N_templates, N_res, N_res, c_z)
         # pair_representation shape: (batch, N_res, N_res, c_z)
 
-        pair = self.layer_norm_pair(pair_representation)
-        template = self.layer_norm_template(template_feat)
-
         # Query from pair representation
         # Shape: (batch, N_res, N_res, total_dim)
-        Q = self.linear_q(pair)
+        Q = self.linear_q(pair_representation)
 
         # Keys and values from template features
         # Shape: (batch, N_templates, N_res, N_res, total_dim)
-        K = self.linear_k(template)
-        V = self.linear_v(template)
+        K = self.linear_k(template_feat)
+        V = self.linear_v(template_feat)
 
         # Reshape to (batch, N_res, N_res, num_heads, head_dim)
         Q = Q.reshape((Q.shape[0], Q.shape[1], Q.shape[2], self.num_heads, self.head_dim))
@@ -159,12 +166,6 @@ class TemplatePointwiseAttention(torch.nn.Module):
         K = K.reshape((K.shape[0], K.shape[1], K.shape[2], K.shape[3], self.num_heads, self.head_dim))
         V = V.reshape((V.shape[0], V.shape[1], V.shape[2], V.shape[3], self.num_heads, self.head_dim))
 
-        G = self.linear_gate(pair)
-        G = G.reshape((G.shape[0], G.shape[1], G.shape[2], self.num_heads, self.head_dim))
-
-        # Squash values in range 0 to 1 to act as gating mechanism
-        G = torch.sigmoid(G)
-
         # Attention over templates: for each residue pair (i,j), attend across templates
         # Q shape (batch, N_res_i, N_res_j, num_heads, head_dim)
         # K shape (batch, N_templates, N_res_i, N_res_j, num_heads, head_dim)
@@ -172,14 +173,17 @@ class TemplatePointwiseAttention(torch.nn.Module):
         scores = torch.einsum('bijhd, btijhd -> btijh', Q, K)
         scores = scores / math.sqrt(self.head_dim)
 
+        # template_mask shape: (batch, N_templates), 1.0 for valid templates
+        if template_mask is not None:
+            mask = template_mask.to(scores.dtype)
+            scores = scores + (1.0 - mask[:, :, None, None, None]) * (-1e9)
+
         # Softmax over templates dimension
         attention = torch.nn.functional.softmax(scores, dim=1)
 
         # Weighted sum over templates
         # Output shape: (batch, N_res, N_res, num_heads, head_dim)
         values = torch.einsum('btijh, btijhd -> bijhd', attention, V)
-
-        values = G * values
 
         # Reshape to (batch, N_res, N_res, total_dim)
         values = values.reshape((values.shape[0], values.shape[1], values.shape[2], -1))
@@ -192,7 +196,7 @@ class ExtraMsaStack(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.layer_norm_msa = torch.nn.LayerNorm(config.c_s)
+        self.layer_norm_msa = torch.nn.LayerNorm(config.c_e)
         self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
 
         self.head_dim = config.extra_msa_dim
@@ -201,19 +205,27 @@ class ExtraMsaStack(torch.nn.Module):
         self.total_dim = self.head_dim * self.num_heads
 
         # MSA row attention with pair bias (inline, same as Algorithm 7)
-        self.linear_q = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim, bias=False)
-        self.linear_k = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim, bias=False)
-        self.linear_v = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim, bias=False)
+        self.linear_q = torch.nn.Linear(in_features=config.c_e, out_features=self.total_dim, bias=False)
+        self.linear_k = torch.nn.Linear(in_features=config.c_e, out_features=self.total_dim, bias=False)
+        self.linear_v = torch.nn.Linear(in_features=config.c_e, out_features=self.total_dim, bias=False)
 
         self.linear_pair = torch.nn.Linear(in_features=config.c_z, out_features=self.num_heads, bias=False)
 
-        self.linear_gate = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim)
+        self.linear_gate = torch.nn.Linear(in_features=config.c_e, out_features=self.total_dim)
 
-        self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_s)
+        self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_e)
 
-        self.msa_col_att = MSAColumnGlobalAttention(config)
-        self.msa_transition = MSATransition(config)
-        self.outer_mean = OuterProductMean(config)
+        self.msa_col_att = MSAColumnGlobalAttention(config, c_in=config.c_e)
+        self.msa_transition = MSATransition(
+            config,
+            c_in=config.c_e,
+            n=getattr(config, "extra_msa_transition_n", config.msa_transition_n),
+        )
+        self.outer_mean = OuterProductMean(
+            config,
+            c_in=config.c_e,
+            c_hidden=getattr(config, "extra_msa_outer_product_dim", config.outer_product_dim),
+        )
 
         self.triangle_mult_out = TriangleMultiplicationOutgoing(config)
         self.triangle_mult_in = TriangleMultiplicationIncoming(config)
@@ -225,7 +237,7 @@ class ExtraMsaStack(torch.nn.Module):
         self.pair_dropout_p = config.extra_pair_dropout
 
     def forward(self, extra_msa_representation: torch.Tensor, pair_representation: torch.Tensor):
-        # extra_msa_representation shape: (batch, N_extra_seq, N_res, c_s)
+        # extra_msa_representation shape: (batch, N_extra_seq, N_res, c_e)
         # pair_representation shape: (batch, N_res, N_res, c_z)
 
         msa_representation = self.layer_norm_msa(extra_msa_representation)
@@ -313,54 +325,53 @@ class ExtraMsaStack(torch.nn.Module):
         return extra_msa_representation, pair_representation
 
 class MSAColumnGlobalAttention(torch.nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, c_in: Optional[int] = None):
         super().__init__()
-        self.layer_norm_msa = torch.nn.LayerNorm(config.c_s)
+        self.c_in = config.c_s if c_in is None else c_in
+        self.layer_norm_msa = torch.nn.LayerNorm(self.c_in)
 
         self.head_dim = config.msa_column_global_attention_dim
         self.num_heads = config.num_heads
 
         self.total_dim = self.head_dim * self.num_heads
 
-        self.linear_q = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim, bias=False)
-        self.linear_k = torch.nn.Linear(in_features=config.c_s, out_features=self.head_dim, bias=False)
-        self.linear_v = torch.nn.Linear(in_features=config.c_s, out_features=self.head_dim, bias=False)
+        self.linear_q = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim, bias=False)
+        self.linear_k = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim, bias=False)
+        self.linear_v = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim, bias=False)
 
-        self.linear_gate = torch.nn.Linear(in_features=config.c_s, out_features=self.total_dim)
+        self.linear_gate = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim)
 
-        self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_s)
+        self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=self.c_in)
 
     def forward(self, msa_representation: torch.Tensor):
         msa_representation = self.layer_norm_msa(msa_representation)
 
+        b, s, i, _ = msa_representation.shape
+
         # Shape (batch, N_seq, N_res, self.total_dim)
-        Q = self.linear_q(msa_representation)
-
-        # Shape (batch, N_seq, N_res, self.head_dim)
-        K = self.linear_k(msa_representation)
-        V = self.linear_v(msa_representation)
-
-        # Reshape to (batch, N_seq, N_res, self.num_heads, self.head_dim)
-        Q = Q.reshape((Q.shape[0], Q.shape[1], Q.shape[2], self.num_heads, self.head_dim))
+        Q = self.linear_q(msa_representation).reshape((b, s, i, self.num_heads, self.head_dim))
+        K = self.linear_k(msa_representation).reshape((b, s, i, self.num_heads, self.head_dim))
+        V = self.linear_v(msa_representation).reshape((b, s, i, self.num_heads, self.head_dim))
 
         # Shape: (batch, N_res, self.num_heads, self.head_dim)
         Q = torch.mean(Q, dim=1)
 
         G = self.linear_gate(msa_representation)
-        G = G.reshape((G.shape[0], G.shape[1], G.shape[2], self.num_heads, self.head_dim))
+        G = G.reshape((b, s, i, self.num_heads, self.head_dim))
 
         # Squash values in range 0 to 1 to act as gating mechanism
         G = torch.sigmoid(G)
 
-        # Shape (batch, self.num_heads, N_seq, N_res)
-        scores = torch.einsum('bihd, btid -> bhti', Q, K)
+        # Shape (batch, N_seq, self.num_heads, N_res)
+        scores = torch.einsum('bihd, bsihd -> bshi', Q, K)
         scores = scores / math.sqrt(self.head_dim)
 
-        attention = torch.nn.functional.softmax(scores, dim=-2)
+        # Softmax over sequences
+        attention = torch.nn.functional.softmax(scores, dim=1)
 
         # Weighted sum over sequences (contract over t)
         # Output: (batch, N_res, num_heads, head_dim)
-        weighted = torch.einsum('bhti, btid -> bihd', attention, V)
+        weighted = torch.einsum('bshi, bsihd -> bihd', attention, V)
 
         # Broadcast to all sequences: (batch, 1, N_res, num_heads, head_dim)
         weighted = weighted.unsqueeze(1)
@@ -392,7 +403,7 @@ class MSAColumnAttention(torch.nn.Module):
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_m)
 
-    def forward(self, msa_representation: torch.Tensor, msa_mask: torch.Tensor = None):
+    def forward(self, msa_representation: torch.Tensor, msa_mask: Optional[torch.Tensor] = None):
         msa_representation = self.layer_norm_msa(msa_representation)
 
         # Shape (batch, N_seq, N_res, self.total_dim)
@@ -436,14 +447,15 @@ class MSAColumnAttention(torch.nn.Module):
 
 
 class MSATransition(torch.nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, c_in: Optional[int] = None, n: Optional[int] = None):
         super().__init__()
-        self.n = config.msa_transition_n
+        self.c_in = config.c_m if c_in is None else c_in
+        self.n = config.msa_transition_n if n is None else n
 
-        self.layer_norm = torch.nn.LayerNorm(config.c_m)
+        self.layer_norm = torch.nn.LayerNorm(self.c_in)
 
-        self.linear_up = torch.nn.Linear(in_features=config.c_m, out_features=self.n*config.c_m)
-        self.linear_down = torch.nn.Linear(in_features=config.c_m*self.n, out_features=config.c_m)
+        self.linear_up = torch.nn.Linear(in_features=self.c_in, out_features=self.n * self.c_in)
+        self.linear_down = torch.nn.Linear(in_features=self.c_in * self.n, out_features=self.c_in)
 
     def forward(self, msa_representation: torch.Tensor):
         msa_representation = self.layer_norm(msa_representation)
@@ -453,14 +465,15 @@ class MSATransition(torch.nn.Module):
         return self.linear_down(torch.nn.functional.relu(activations))
 
 class OuterProductMean(torch.nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, c_in: Optional[int] = None, c_hidden: Optional[int] = None):
         super().__init__()
-        self.layer_norm = torch.nn.LayerNorm(config.c_m)
+        self.c_in = config.c_m if c_in is None else c_in
+        self.layer_norm = torch.nn.LayerNorm(self.c_in)
 
-        self.c = config.outer_product_dim
+        self.c = config.outer_product_dim if c_hidden is None else c_hidden
 
-        self.linear_left = torch.nn.Linear(config.c_m, self.c)
-        self.linear_right = torch.nn.Linear(config.c_m, self.c)
+        self.linear_left = torch.nn.Linear(self.c_in, self.c)
+        self.linear_right = torch.nn.Linear(self.c_in, self.c)
 
         self.linear_out = torch.nn.Linear(in_features=self.c*self.c, out_features=config.c_z)
 
@@ -578,7 +591,7 @@ class TriangleAttentionStartingNode(torch.nn.Module):
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
 
-    def forward(self, pair_representation: torch.Tensor, pair_mask: torch.Tensor = None):
+    def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm(pair_representation)
 
         # Shape (batch, N_res, N_res, self.total_dim)
@@ -646,7 +659,7 @@ class TriangleAttentionEndingNode(torch.nn.Module):
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
 
-    def forward(self, pair_representation: torch.Tensor, pair_mask: torch.Tensor = None):
+    def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm(pair_representation)
 
         # Shape (batch, N_res, N_res, self.total_dim)

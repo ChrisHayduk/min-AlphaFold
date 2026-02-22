@@ -1,5 +1,6 @@
 import torch
 import math
+from typing import Optional
 from utils import dropout_columnwise, dropout_rowwise
 from embedders import MSATransition, MSAColumnAttention, OuterProductMean, TriangleAttentionEndingNode, TriangleAttentionStartingNode, TriangleMultiplicationIncoming, TriangleMultiplicationOutgoing, PairTransition
 
@@ -18,24 +19,32 @@ class Evoformer(torch.nn.Module):
 
         self.pair_transition = PairTransition(config)
 
+        # Dropout rates from config
+        self.msa_dropout = config.evoformer_msa_dropout
+        self.pair_dropout = config.evoformer_pair_dropout
+
     def forward(self, msa_representation: torch.Tensor, pair_representation: torch.Tensor,
-                msa_mask: torch.Tensor = None, pair_mask: torch.Tensor = None):
+                msa_mask: Optional[torch.Tensor] = None, pair_mask: Optional[torch.Tensor] = None):
         # msa_mask: (batch, N_seq, N_res) — 1 for valid, 0 for padding
         # pair_mask: (batch, N_res, N_res) — 1 for valid, 0 for padding
+        assert msa_representation.ndim == 4, \
+            f"msa_representation must be (batch, N_seq, N_res, c_m), got {msa_representation.shape}"
+        assert pair_representation.ndim == 4, \
+            f"pair_representation must be (batch, N_res, N_res, c_z), got {pair_representation.shape}"
         # Shape (batch, N_seq, N_res, c_m)
         z = self.msa_row_att(msa_representation, pair_representation, msa_mask=msa_mask)
-        msa_representation += dropout_rowwise(z, p=0.15, training=self.training)
+        msa_representation += dropout_rowwise(z, p=self.msa_dropout, training=self.training)
 
-        msa_representation += dropout_columnwise(self.msa_col_att(msa_representation, msa_mask=msa_mask), p=0.15, training=self.training)
-        msa_representation += dropout_rowwise(self.msa_transition(msa_representation), p=0.15, training=self.training)
+        msa_representation += dropout_columnwise(self.msa_col_att(msa_representation, msa_mask=msa_mask), p=self.msa_dropout, training=self.training)
+        msa_representation += dropout_rowwise(self.msa_transition(msa_representation), p=self.msa_dropout, training=self.training)
 
         pair_representation += self.outer_mean(msa_representation)
 
-        pair_representation += dropout_rowwise(self.triangle_mult_out(pair_representation), p=0.25, training=self.training)
-        pair_representation += dropout_rowwise(self.triangle_mult_in(pair_representation), p=0.25, training=self.training)
-        pair_representation += dropout_rowwise(self.triangle_att_start(pair_representation, pair_mask=pair_mask), p=0.25, training=self.training)
-        pair_representation += dropout_columnwise(self.triangle_att_end(pair_representation, pair_mask=pair_mask), p=0.25, training=self.training)
-        pair_representation += dropout_rowwise(self.pair_transition(pair_representation), p=0.25, training=self.training)
+        pair_representation += dropout_rowwise(self.triangle_mult_out(pair_representation), p=self.pair_dropout, training=self.training)
+        pair_representation += dropout_rowwise(self.triangle_mult_in(pair_representation), p=self.pair_dropout, training=self.training)
+        pair_representation += dropout_rowwise(self.triangle_att_start(pair_representation, pair_mask=pair_mask), p=self.pair_dropout, training=self.training)
+        pair_representation += dropout_columnwise(self.triangle_att_end(pair_representation, pair_mask=pair_mask), p=self.pair_dropout, training=self.training)
+        pair_representation += dropout_rowwise(self.pair_transition(pair_representation), p=self.pair_dropout, training=self.training)
 
         return msa_representation, pair_representation
 
@@ -61,7 +70,7 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_m)
 
     def forward(self, msa_representation: torch.Tensor, pair_representation: torch.Tensor,
-                msa_mask: torch.Tensor = None):
+                msa_mask: Optional[torch.Tensor] = None):
         msa_representation = self.layer_norm_msa(msa_representation)
 
         # Shape (batch, N_seq, N_res, self.total_dim)

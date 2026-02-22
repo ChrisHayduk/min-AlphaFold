@@ -32,10 +32,10 @@ class pLDDTHead(torch.nn.Module):
 class MaskedMSAHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.linear = torch.nn.Linear(config.c_s, config.n_msa_classes)
+        self.linear = torch.nn.Linear(config.c_m, config.n_msa_classes)
 
     def forward(self, msa_representation: torch.Tensor):
-        # msa_representation: (batch, N_seq, N_res, c_s)
+        # msa_representation: (batch, N_seq, N_res, c_m)
         return self.linear(msa_representation)  # (batch, N_seq, N_res, n_msa_classes)
 
 
