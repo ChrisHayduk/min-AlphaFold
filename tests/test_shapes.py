@@ -331,8 +331,8 @@ class TestDistogramHead:
 
 class TestPLDDTHead:
     def test_output_shape(self, cfg):
-        from heads import pLDDTHead
-        module = pLDDTHead(cfg)
+        from heads import PLDDTHead
+        module = PLDDTHead(cfg)
         s = torch.randn(B, N_res, cfg.c_s)
         out = module(s)
         assert out.shape == (B, N_res, cfg.n_plddt_bins)
@@ -414,7 +414,7 @@ class TestAlphaFold2:
         aatype = torch.randint(0, 20, (B, N_res))
 
         with torch.no_grad():
-            structure_preds, pair_repr, msa_repr, single_rep = model(
+            structure_preds, pair_repr, msa_repr, single_reps = model(
                 target_feat, residue_index, msa_feat,
                 extra_msa_feat, template_pair_feat, aatype,
                 template_angle_feat=template_angle_feat,
@@ -424,7 +424,8 @@ class TestAlphaFold2:
 
         assert pair_repr.shape == (B, N_res, N_res, cfg.c_z)
         assert msa_repr.shape == (B, N_seq, N_res, cfg.c_m)
-        assert single_rep.shape == (B, N_res, cfg.c_s)
+        assert single_reps["single_pre_sm"].shape == (B, N_res, cfg.c_s)
+        assert single_reps["single_post_sm"].shape == (B, N_res, cfg.c_s)
         assert structure_preds["atom14_coords"].shape == (B, N_res, 14, 3)
         assert structure_preds["atom14_mask"].shape == (B, N_res, 14)
         assert structure_preds["final_rotations"].shape == (B, N_res, 3, 3)

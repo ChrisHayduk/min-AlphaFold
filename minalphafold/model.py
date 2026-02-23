@@ -107,9 +107,15 @@ class AlphaFold2(torch.nn.Module):
             aatype: torch.Tensor,
             template_angle_feat: torch.Tensor | None = None,
             template_mask: torch.Tensor | None = None,
+            seq_mask: torch.Tensor | None = None,
+            msa_mask: torch.Tensor | None = None,
+            extra_msa_mask: torch.Tensor | None = None,
             n_cycles: int = 3,
             n_ensemble: int = 1,
         ):
+        # seq_mask: (batch, N_res) — 1 for valid residues, 0 for padding
+        # msa_mask: (batch, N_seq, N_res) — 1 for valid, 0 for padding
+        # extra_msa_mask: (batch, N_extra, N_res) — 1 for valid, 0 for padding
         assert(n_ensemble > 0)
         assert(n_cycles > 0)
 
@@ -122,6 +128,15 @@ class AlphaFold2(torch.nn.Module):
         c_m = self.config.c_m
         c_z = self.config.c_z
         batch_size = target_feat.shape[0]
+
+        # Default masks: all ones (no padding)
+        if seq_mask is None:
+            seq_mask = target_feat.new_ones(batch_size, N_res)
+        pair_mask = seq_mask[:, :, None] * seq_mask[:, None, :]  # (batch, N_res, N_res)
+        if msa_mask is None:
+            msa_mask = target_feat.new_ones(batch_size, msa_feat.shape[1], N_res)
+        if extra_msa_mask is None:
+            extra_msa_mask = target_feat.new_ones(batch_size, extra_msa_feat.shape[1], N_res)
 
         # Initialize recycling tensors (only once, before the loop)
         single_rep_prev = torch.zeros(batch_size, N_res, c_m, device=msa_feat.device)
@@ -164,19 +179,30 @@ class AlphaFold2(torch.nn.Module):
                     )
 
                     # Template torsion-angle features are appended as extra MSA rows.
+                    evo_msa_mask = msa_mask
                     if template_angle_feat is not None:
                         template_angle_repr = self.template_angle_linear_2(
                             torch.relu(self.template_angle_linear_1(template_angle_feat))
                         )
                         msa_repr = torch.cat([msa_repr, template_angle_repr], dim=1)
+                        # Extend msa_mask for appended template rows (all valid)
+                        n_templ = template_angle_repr.shape[1]
+                        templ_mask = msa_mask.new_ones(batch_size, n_templ, N_res)
+                        evo_msa_mask = torch.cat([msa_mask, templ_mask], dim=1)
 
                     # Extra MSA processing
                     extra_msa_repr = self.extra_msa_feat_linear(extra_msa_feat)
                     for extra_block in self.extra_msa_blocks:
-                        extra_msa_repr, pair_repr = extra_block(extra_msa_repr, pair_repr)
+                        extra_msa_repr, pair_repr = extra_block(
+                            extra_msa_repr, pair_repr,
+                            extra_msa_mask=extra_msa_mask, pair_mask=pair_mask,
+                        )
 
                     for block in self.evoformer_blocks:
-                        msa_repr, pair_repr = block(msa_repr, pair_repr)
+                        msa_repr, pair_repr = block(
+                            msa_repr, pair_repr,
+                            msa_mask=evo_msa_mask, pair_mask=pair_mask,
+                        )
 
                     single_rep_accum += msa_repr[:, 0, :, :]
                     pair_repr_accum += pair_repr
@@ -192,7 +218,10 @@ class AlphaFold2(torch.nn.Module):
                 structure_predictions = self.structure_model(single_rep, pair_repr, aatype)
 
                 if is_last:
-                    return structure_predictions, pair_repr, msa_repr, single_rep
+                    return structure_predictions, pair_repr, msa_repr, {
+                        "single_pre_sm": single_rep,
+                        "single_post_sm": structure_predictions["single"],
+                    }
 
                 # Recycle: store pre-projection single rep (c_m) for next cycle
                 single_rep_prev = msa_first_row.detach()

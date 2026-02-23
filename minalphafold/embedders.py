@@ -236,9 +236,12 @@ class ExtraMsaStack(torch.nn.Module):
         self.msa_dropout_p = config.extra_msa_dropout
         self.pair_dropout_p = config.extra_pair_dropout
 
-    def forward(self, extra_msa_representation: torch.Tensor, pair_representation: torch.Tensor):
+    def forward(self, extra_msa_representation: torch.Tensor, pair_representation: torch.Tensor,
+                extra_msa_mask: Optional[torch.Tensor] = None, pair_mask: Optional[torch.Tensor] = None):
         # extra_msa_representation shape: (batch, N_extra_seq, N_res, c_e)
         # pair_representation shape: (batch, N_res, N_res, c_z)
+        # extra_msa_mask: (batch, N_extra_seq, N_res) — 1 for valid, 0 for padding
+        # pair_mask: (batch, N_res, N_res) — 1 for valid, 0 for padding
 
         msa_representation = self.layer_norm_msa(extra_msa_representation)
         pair_norm = self.layer_norm_pair(pair_representation)
@@ -275,6 +278,11 @@ class ExtraMsaStack(torch.nn.Module):
         scores = torch.einsum('bsihd, bsjhd -> bshij', Q, K)
         scores = scores / math.sqrt(self.head_dim) + B
 
+        # Apply extra MSA mask to key positions (j dimension)
+        if extra_msa_mask is not None:
+            mask_bias = (1.0 - extra_msa_mask[:, :, None, None, :]) * (-1e9)
+            scores = scores + mask_bias
+
         attention = torch.nn.functional.softmax(scores, dim=-1)
 
         # Shape (batch, N_extra_seq, N_res, num_heads, head_dim)
@@ -287,6 +295,10 @@ class ExtraMsaStack(torch.nn.Module):
 
         row_update = self.linear_output(values)
 
+        # Zero out padded query positions
+        if extra_msa_mask is not None:
+            row_update = row_update * extra_msa_mask[..., None]
+
         # --- MSA representation updates ---
 
         extra_msa_representation = extra_msa_representation + dropout_rowwise(
@@ -294,29 +306,31 @@ class ExtraMsaStack(torch.nn.Module):
             p=self.msa_dropout_p,
             training=self.training,
         )
-        extra_msa_representation = extra_msa_representation + self.msa_col_att(extra_msa_representation)
+        extra_msa_representation = extra_msa_representation + self.msa_col_att(
+            extra_msa_representation, msa_mask=extra_msa_mask)
         extra_msa_representation = extra_msa_representation + self.msa_transition(extra_msa_representation)
 
         # --- Pair representation updates ---
 
-        pair_representation = pair_representation + self.outer_mean(extra_msa_representation)
+        pair_representation = pair_representation + self.outer_mean(
+            extra_msa_representation, msa_mask=extra_msa_mask)
         pair_representation = pair_representation + dropout_rowwise(
-            self.triangle_mult_out(pair_representation),
+            self.triangle_mult_out(pair_representation, pair_mask=pair_mask),
             p=self.pair_dropout_p,
             training=self.training,
         )
         pair_representation = pair_representation + dropout_rowwise(
-            self.triangle_mult_in(pair_representation),
+            self.triangle_mult_in(pair_representation, pair_mask=pair_mask),
             p=self.pair_dropout_p,
             training=self.training,
         )
         pair_representation = pair_representation + dropout_rowwise(
-            self.triangle_att_start(pair_representation),
+            self.triangle_att_start(pair_representation, pair_mask=pair_mask),
             p=self.pair_dropout_p,
             training=self.training,
         )
         pair_representation = pair_representation + dropout_columnwise(
-            self.triangle_att_end(pair_representation),
+            self.triangle_att_end(pair_representation, pair_mask=pair_mask),
             p=self.pair_dropout_p,
             training=self.training,
         )
@@ -343,7 +357,8 @@ class MSAColumnGlobalAttention(torch.nn.Module):
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=self.c_in)
 
-    def forward(self, msa_representation: torch.Tensor):
+    def forward(self, msa_representation: torch.Tensor, msa_mask: Optional[torch.Tensor] = None):
+        # msa_mask: (batch, N_seq, N_res) — 1 for valid, 0 for padding
         msa_representation = self.layer_norm_msa(msa_representation)
 
         b, s, i, _ = msa_representation.shape
@@ -366,6 +381,12 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         scores = torch.einsum('bihd, bsihd -> bshi', Q, K)
         scores = scores / math.sqrt(self.head_dim)
 
+        # Mask key positions (sequence dim)
+        if msa_mask is not None:
+            # msa_mask: (batch, N_seq, N_res) -> (batch, N_seq, 1, N_res)
+            mask_bias = (1.0 - msa_mask[:, :, None, :]) * (-1e9)
+            scores = scores + mask_bias
+
         # Softmax over sequences
         attention = torch.nn.functional.softmax(scores, dim=1)
 
@@ -382,6 +403,10 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         values = values.reshape(values.shape[0], values.shape[1], values.shape[2], -1)
 
         output = self.linear_output(values)
+
+        # Zero out padded query positions
+        if msa_mask is not None:
+            output = output * msa_mask[..., None]
 
         return output
 
@@ -443,6 +468,10 @@ class MSAColumnAttention(torch.nn.Module):
 
         output = self.linear_output(values)
 
+        # Zero out padded query positions
+        if msa_mask is not None:
+            output = output * msa_mask[..., None]
+
         return output
 
 
@@ -477,21 +506,30 @@ class OuterProductMean(torch.nn.Module):
 
         self.linear_out = torch.nn.Linear(in_features=self.c*self.c, out_features=config.c_z)
 
-    def forward(self, msa_representation: torch.Tensor):
+    def forward(self, msa_representation: torch.Tensor, msa_mask: Optional[torch.Tensor] = None):
+        # msa_mask: (batch, N_seq, N_res) — 1 for valid, 0 for padding
         msa_representation = self.layer_norm(msa_representation)
 
         # Shape (batch, N_seq, N_res, self.c)
         A = self.linear_left(msa_representation)
         B = self.linear_right(msa_representation)
 
-        # Shape (batch, N_seq, N_res, N_res, self.c, self.c)
-        # We sum over N_seq implicitly by not including s in the output
-        # This reduces the tensor size that we need to store
+        if msa_mask is not None:
+            # Zero out padded MSA rows before outer product
+            m = msa_mask.to(A.dtype)              # (batch, N_seq, N_res)
+            A = A * m[..., None]                   # (batch, N_seq, N_res, c)
+            B = B * m[..., None]
+
+        # Sum over N_seq: (batch, N_res_i, N_res_j, c, c)
         outer = torch.einsum('bsic, bsjd -> bijcd', A, B)
-        
-        # Shape (batch, N_res, N_res, self.c, self.c)
-        # Now divide by N_seq to get mean
-        mean_val = outer / msa_representation.shape[1]
+
+        if msa_mask is not None:
+            # Mask-aware normalization: count valid (s,i)*(s,j) pairs
+            m = msa_mask.to(A.dtype)
+            norm = torch.einsum('bsi, bsj -> bij', m, m).clamp(min=1.0)  # (batch, N_res, N_res)
+            mean_val = outer / norm[..., None, None]
+        else:
+            mean_val = outer / msa_representation.shape[1]
 
         # Shape (batch, N_res, N_res, self.c*self.c)
         mean_val = mean_val.reshape(mean_val.shape[0], mean_val.shape[1], mean_val.shape[2], -1)
@@ -514,13 +552,18 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
 
         self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
 
-    def forward(self, pair_representation: torch.Tensor):
+    def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm_pair(pair_representation)
 
         # Shape (batch, N_res, N_res, config.triangle_mult_c)
         A = torch.sigmoid(self.gate1(pair_representation)) * self.linear1(pair_representation)
         B = torch.sigmoid(self.gate2(pair_representation)) * self.linear2(pair_representation)
-        
+
+        # Mask out padded positions before contraction
+        if pair_mask is not None:
+            A = A * pair_mask[..., None]
+            B = B * pair_mask[..., None]
+
         # Shape (batch, N_res, N_res, c_z)
         G = torch.sigmoid(self.gate(pair_representation))
 
@@ -531,7 +574,10 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
 
         # Shape (batch, N_res, N_res, c_z)
         out = G * self.out_linear(self.layer_norm_out(vals))
-        
+
+        if pair_mask is not None:
+            out = out * pair_mask[..., None]
+
         return out
 
 
@@ -551,24 +597,32 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
 
         self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
 
-    def forward(self, pair_representation: torch.Tensor):
+    def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm_pair(pair_representation)
 
         # Shape (batch, N_res, N_res, config.triangle_mult_c)
         A = torch.sigmoid(self.gate1(pair_representation)) * self.linear1(pair_representation)
         B = torch.sigmoid(self.gate2(pair_representation)) * self.linear2(pair_representation)
-        
+
+        # Mask out padded positions before contraction
+        if pair_mask is not None:
+            A = A * pair_mask[..., None]
+            B = B * pair_mask[..., None]
+
         # Shape (batch, N_res, N_res, c_z)
         G = torch.sigmoid(self.gate(pair_representation))
 
-        # A: (batch, N_res_i, N_res_k, c)
-        # B: (batch, N_res_j, N_res_k, c)
+        # A: (batch, N_res_k, N_res_i, c)
+        # B: (batch, N_res_k, N_res_j, c)
         # Result: (batch, N_res_i, N_res_j, c)
         vals = torch.einsum('bkic, bkjc -> bijc', A, B)
 
         # Shape (batch, N_res, N_res, c_z)
         out = G * self.out_linear(self.layer_norm_out(vals))
-        
+
+        if pair_mask is not None:
+            out = out * pair_mask[..., None]
+
         return out
 
 class TriangleAttentionStartingNode(torch.nn.Module):
@@ -637,6 +691,10 @@ class TriangleAttentionStartingNode(torch.nn.Module):
 
         output = self.linear_output(values)
 
+        # Zero out padded query positions
+        if pair_mask is not None:
+            output = output * pair_mask[..., None]
+
         return output
 
 class TriangleAttentionEndingNode(torch.nn.Module):
@@ -683,11 +741,12 @@ class TriangleAttentionEndingNode(torch.nn.Module):
 
         # Q shape (batch, N_res_i, N_res_j, self.num_heads, self.head_dim)
         # K shape (batch, N_res_k, N_res_j, self.num_heads, self.head_dim)
-        # B shape (batch, N_res_i, N_res_k, self.num_heads)
+        # B shape (batch, N_res, N_res, self.num_heads) — Algorithm 14 requires b_{k,i}
         # Output shape (batch, N_res_i, N_res_j, N_res_k, self.num_heads)
 
         scores = torch.einsum('bijhd, bkjhd -> bijkh', Q, K)
-        scores = scores / math.sqrt(self.head_dim) + B.unsqueeze(2)
+        # B.transpose(1,2): (b, k, i, h) -> unsqueeze(2): (b, k, 1, i, h) -> broadcasts to (b, i, j, k, h)
+        scores = scores / math.sqrt(self.head_dim) + B.transpose(1, 2).unsqueeze(2)
 
         # Apply pair mask to key positions (k dimension, for a given j)
         if pair_mask is not None:
@@ -706,6 +765,10 @@ class TriangleAttentionEndingNode(torch.nn.Module):
         values = values.reshape((Q.shape[0], Q.shape[1], Q.shape[2], -1))
 
         output = self.linear_output(values)
+
+        # Zero out padded query positions
+        if pair_mask is not None:
+            output = output * pair_mask[..., None]
 
         return output
 

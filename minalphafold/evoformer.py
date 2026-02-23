@@ -35,16 +35,18 @@ class Evoformer(torch.nn.Module):
         z = self.msa_row_att(msa_representation, pair_representation, msa_mask=msa_mask)
         msa_representation += dropout_rowwise(z, p=self.msa_dropout, training=self.training)
 
-        msa_representation += dropout_columnwise(self.msa_col_att(msa_representation, msa_mask=msa_mask), p=self.msa_dropout, training=self.training)
-        msa_representation += dropout_rowwise(self.msa_transition(msa_representation), p=self.msa_dropout, training=self.training)
+        # No dropout on column attention or MSA transition per Algorithm 6
+        msa_representation += self.msa_col_att(msa_representation, msa_mask=msa_mask)
+        msa_representation += self.msa_transition(msa_representation)
 
-        pair_representation += self.outer_mean(msa_representation)
+        pair_representation += self.outer_mean(msa_representation, msa_mask=msa_mask)
 
-        pair_representation += dropout_rowwise(self.triangle_mult_out(pair_representation), p=self.pair_dropout, training=self.training)
-        pair_representation += dropout_rowwise(self.triangle_mult_in(pair_representation), p=self.pair_dropout, training=self.training)
+        pair_representation += dropout_rowwise(self.triangle_mult_out(pair_representation, pair_mask=pair_mask), p=self.pair_dropout, training=self.training)
+        pair_representation += dropout_rowwise(self.triangle_mult_in(pair_representation, pair_mask=pair_mask), p=self.pair_dropout, training=self.training)
         pair_representation += dropout_rowwise(self.triangle_att_start(pair_representation, pair_mask=pair_mask), p=self.pair_dropout, training=self.training)
         pair_representation += dropout_columnwise(self.triangle_att_end(pair_representation, pair_mask=pair_mask), p=self.pair_dropout, training=self.training)
-        pair_representation += dropout_rowwise(self.pair_transition(pair_representation), p=self.pair_dropout, training=self.training)
+        # No dropout on pair transition per Algorithm 6
+        pair_representation += self.pair_transition(pair_representation)
 
         return msa_representation, pair_representation
 
@@ -120,5 +122,9 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
         values = values.reshape((Q.shape[0], Q.shape[1], Q.shape[2], -1))
 
         output = self.linear_output(values)
+
+        # Zero out padded query positions
+        if msa_mask is not None:
+            output = output * msa_mask[..., None]
 
         return output

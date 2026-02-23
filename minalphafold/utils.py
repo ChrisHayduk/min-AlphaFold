@@ -11,9 +11,11 @@ def dropout_rowwise(x, p, training):
 
 def distance_bin(positions, n_bins, d_min=2.0, d_max=22.0):
     dists = torch.cdist(positions, positions)
-    bin_edges = torch.linspace(d_min, d_max, n_bins - 1, device=positions.device)
+    # AF2-style uniform-width bins: width = (d_max - d_min) / n_bins
+    step = (d_max - d_min) / n_bins
+    bin_edges = d_min + step * torch.arange(1, n_bins, device=positions.device, dtype=dists.dtype)
     bin_idx = torch.bucketize(dists, bin_edges)
-    return torch.nn.functional.one_hot(bin_idx, n_bins).float()
+    return torch.nn.functional.one_hot(bin_idx, n_bins).to(dtype=positions.dtype)
 
 def dropout_columnwise(x, p, training):
     """Mask shared across dim 1 (rows)."""

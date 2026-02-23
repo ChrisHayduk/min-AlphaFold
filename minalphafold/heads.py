@@ -12,7 +12,7 @@ class DistogramHead(torch.nn.Module):
         return logits
 
 
-class pLDDTHead(torch.nn.Module):
+class PLDDTHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.net = torch.nn.Sequential(
