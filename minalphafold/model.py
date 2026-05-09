@@ -1,14 +1,16 @@
-import torch
-import torch.utils.checkpoint as torch_checkpoint
 import math
 from typing import cast
 
+import torch
+import torch.utils.checkpoint as torch_checkpoint
+
+from .embedders import ExtraMsaStack, InputEmbedder, TemplatePair, TemplatePointwiseAttention
 from .evoformer import Evoformer
-from .structure_module import StructureModule
+from .heads import DistogramHead, ExperimentallyResolvedHead, MaskedMSAHead, PLDDTHead, TMScoreHead
 from .initialization import init_gate_linear, init_linear, zero_linear
-from .embedders import InputEmbedder, TemplatePair, TemplatePointwiseAttention, ExtraMsaStack
-from .heads import DistogramHead, PLDDTHead, MaskedMSAHead, TMScoreHead, ExperimentallyResolvedHead
+from .structure_module import StructureModule
 from .utils import recycling_distance_bin
+
 
 class AlphaFold2(torch.nn.Module):
     """Top-level AlphaFold2 model (Algorithm 2).
@@ -190,6 +192,7 @@ class AlphaFold2(torch.nn.Module):
             n_cycles: int = 3,
             n_ensemble: int = 1,
             detach_rotations: bool = True,
+            sample_recycles: bool | None = None,
         ):
         """Algorithm 2 forward pass. See the class docstring for the full map."""
         # seq_mask: (batch, N_res) — 1 for valid residues, 0 for padding
@@ -198,7 +201,10 @@ class AlphaFold2(torch.nn.Module):
         assert n_ensemble > 0
         assert n_cycles > 0
 
-        if self.training:
+        if sample_recycles is None:
+            sample_recycles = self.training
+
+        if sample_recycles:
             # Algorithm 31 line 1: N' ~ Uniform(1, N_cycle). Only iteration
             # N' carries gradients; earlier iterations are stop-grad'd via the
             # detach() calls at the bottom of the loop (Algorithm 31 line 4).

@@ -580,6 +580,40 @@ class TestRecyclingDistanceBin:
 # ======================== model.py (full forward) ========================
 
 class TestAlphaFold2:
+    def test_training_forward_can_disable_recycle_sampling(self, cfg, monkeypatch):
+        from minalphafold.model import AlphaFold2
+
+        model = AlphaFold2(cfg)
+        model.train()
+
+        N_templ = 2
+        N_extra = 8
+        target_feat = torch.randn(B, N_res, 22)
+        residue_index = torch.arange(N_res).unsqueeze(0).expand(B, -1)
+        msa_feat = torch.randn(B, N_seq, N_res, 49)
+        extra_msa_feat = torch.randn(B, N_extra, N_res, 25)
+        template_pair_feat = torch.randn(B, N_templ, N_res, N_res, 88)
+        template_angle_feat = torch.randn(B, N_templ, N_res, 57)
+        template_mask = torch.ones(B, N_templ)
+        aatype = torch.zeros(B, N_res, dtype=torch.long)
+
+        def fail_randint(*args, **kwargs):
+            raise AssertionError("recycle sampling should be disabled")
+
+        monkeypatch.setattr(torch, "randint", fail_randint)
+
+        outputs = model(
+            target_feat, residue_index, msa_feat,
+            extra_msa_feat, template_pair_feat, aatype,
+            template_angle_feat=template_angle_feat,
+            template_mask=template_mask,
+            n_cycles=2, n_ensemble=1,
+            sample_recycles=False,
+        )
+
+        assert model.last_n_cycles == 2
+        assert outputs["atom14_coords"].shape == (B, N_res, 14, 3)
+
     def test_forward_shapes(self, cfg):
         from minalphafold.model import AlphaFold2
         model = AlphaFold2(cfg)
